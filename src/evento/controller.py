@@ -5,13 +5,13 @@ from sqlalchemy.orm import Session
 from src.database import obter_banco
 from src.evento.repository import RepositorioEvento
 from src.evento.service import ServicoEvento
-from src.evento.schema import RespostaEvento, SolicitacaoEvento
+from src.evento.schema import RespostaEvento, SolicitacaoEvento, RespostaItemGaleria
 from src.calendario.service import ServicoCalendario
 from src.drive.schema import RespostaDrive
 from src.drive.service import ServicoDrive
 from src.mapa.service import ServicoMapa
 from src.banda_palestrante.schema import RespostaBandaPalestrante
-from src.security import verificar_roles
+from src.security import verificar_roles, verificar_permissao_setor, SETOR_EVENTOS
 
 router = APIRouter(prefix="/evento", tags=["evento"])
 security = HTTPBearer()
@@ -29,7 +29,7 @@ def get_servico(db: Session = Depends(obter_banco)):
 def criar_evento(
     solicitar: SolicitacaoEvento,
     servico: ServicoEvento = Depends(get_servico),
-    _: dict = Depends(verificar_roles(["admin", "superadmin"]))
+    _: dict = Depends(verificar_permissao_setor(SETOR_EVENTOS))
 ):
     try:
         return servico.criar_evento(solicitar)
@@ -63,7 +63,7 @@ def atualizar_evento(
     evento_id: int,
     solicitar: SolicitacaoEvento,
     servico: ServicoEvento = Depends(get_servico),
-    _: dict = Depends(verificar_roles(["admin", "superadmin"]))
+    _: dict = Depends(verificar_permissao_setor(SETOR_EVENTOS))
 ):
     try:
         return servico.atualizar_evento(evento_id, solicitar)
@@ -75,12 +75,48 @@ def atualizar_evento(
 def deletar_evento(
     evento_id: int,
     servico: ServicoEvento = Depends(get_servico),
-    _: dict = Depends(verificar_roles(["admin", "superadmin"]))
+    _: dict = Depends(verificar_roles(["superadmin"]))
 ):
     try:
         servico.deletar_evento(evento_id)
     except ValueError as erro:
         raise HTTPException(status_code=404, detail=str(erro)) from erro
+
+
+@router.get("/galerias/todas", response_model=list[RespostaItemGaleria])
+def listar_todas_galerias(servico: ServicoEvento = Depends(get_servico)):
+    """
+    Retorna de uma vez todas as fotos de todos os eventos que possuem galeria configurada,
+    evitando N+1 requisicoes (DDoS no backend). O resultado já traz o nome do evento.
+    """
+    try:
+        eventos = servico.listar_evento()
+        drive = ServicoDrive()
+        resultado = []
+
+        for evento in eventos:
+            if not evento.link_galeria:
+                continue
+
+            try:
+                fotos = drive.listar_fotos(evento.link_galeria)
+                for foto in fotos:
+                    resultado.append(
+                        RespostaItemGaleria(
+                            id=foto.id,
+                            image=foto.url_visualizacao,
+                            event=evento.nome,
+                            location=evento.nome_local or ""
+                        )
+                    )
+            except Exception as e:
+                print(f"Erro ao buscar galeria do evento {evento.evento_id}: {e}")
+                continue
+
+        return resultado
+
+    except RuntimeError as erro:
+        raise HTTPException(status_code=502, detail=str(erro)) from erro
 
 
 @router.get("/{evento_id}/galeria", response_model=list[RespostaDrive])
@@ -128,7 +164,7 @@ def adicionar_participante_evento(
     evento_id: int,
     participante_id: int,
     servico: ServicoEvento = Depends(get_servico),
-    _: dict = Depends(verificar_roles(["admin", "superadmin"])),
+    _: dict = Depends(verificar_permissao_setor(SETOR_EVENTOS)),
 ):
     try:
         return servico.adicionar_participante(evento_id, participante_id)
@@ -144,7 +180,7 @@ def remover_participante_evento(
     evento_id: int,
     participante_id: int,
     servico: ServicoEvento = Depends(get_servico),
-    _: dict = Depends(verificar_roles(["admin", "superadmin"])),
+    _: dict = Depends(verificar_roles(["superadmin"])),
 ):
     try:
         servico.remover_participante(evento_id, participante_id)
