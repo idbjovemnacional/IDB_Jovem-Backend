@@ -1,9 +1,25 @@
-from src.evento.schema import SolicitacaoEvento
+from src.evento.schema import (
+    SituacaoEvento,
+    SolicitacaoEvento,
+    SolicitacaoFotosExcluidas,
+    SolicitacaoSituacaoEvento,
+)
 from src.shared.utils import validar_datas, validar_coordenadas
 from src.evento.model import Evento
 from src.evento.repository import RepositorioEvento
 from src.calendario.service import ServicoCalendario
 from src.mapa.service import ServicoMapa
+
+
+def _limpar_nova_data_fora_do_adiado(evento: Evento) -> None:
+    """US14: quem está ativo ou cancelado não carrega a data do adiamento."""
+    if evento.situacao != SituacaoEvento.ADIADO:
+        evento.nova_data = None
+
+
+def _is_online(modalidade) -> bool:
+    valor = getattr(modalidade, "value", modalidade)
+    return str(valor).strip().lower() == "online"
 
 
 class ServicoEvento:
@@ -19,20 +35,31 @@ class ServicoEvento:
 
     def criar_evento(self, dados: SolicitacaoEvento):
         validar_datas(dados.data_inicio, dados.data_fim)
-        validar_coordenadas(dados.local_latitude, dados.local_longitude)
         evento = Evento(**dados.model_dump())
+        _limpar_nova_data_fora_do_adiado(evento)
         evento = self.repositorio.salvar(evento)
 
-        nome_local = self.mapa_servico.buscar_endereco_por_coordenadas(
-            evento.local_latitude,
-            evento.local_longitude
-        )
+        if _is_online(evento.modalidade):
+            evento.modalidade = "online"
+            evento.local_latitude = None
+            evento.local_longitude = None
+            evento.nome_local = None
+            local_calendario = evento.link_transmissao or "Online"
+        else:
+            evento.modalidade = "presencial"
+            evento.link_transmissao = None
+            validar_coordenadas(evento.local_latitude, evento.local_longitude)
+            nome_local = self.mapa_servico.buscar_endereco_por_coordenadas(
+                evento.local_latitude,
+                evento.local_longitude
+            )
+            evento.nome_local = nome_local
+            local_calendario = nome_local
 
-        evento.nome_local = nome_local
         evento = self.repositorio.salvar(evento)
 
         try:
-            calendario_id = self.calendario.criar_evento(evento, nome_local)
+            calendario_id = self.calendario.criar_evento(evento, local_calendario)
             evento.calendario_evento_id = calendario_id
             evento = self.repositorio.salvar(evento)
 
@@ -61,30 +88,81 @@ class ServicoEvento:
         for campo, novo_valor in dados_mudanca.items():
             setattr(evento, campo, novo_valor)
 
+        _limpar_nova_data_fora_do_adiado(evento)
         validar_datas(evento.data_inicio, evento.data_fim)
-        validar_coordenadas(evento.local_latitude, evento.local_longitude)
 
-        evento.nome_local = self.mapa_servico.buscar_endereco_por_coordenadas(
-            evento.local_latitude,
-            evento.local_longitude
-        )
+        if _is_online(evento.modalidade):
+            evento.modalidade = "online"
+            evento.local_latitude = None
+            evento.local_longitude = None
+            evento.nome_local = None
+            local_calendario = evento.link_transmissao or "Online"
+        else:
+            evento.modalidade = "presencial"
+            evento.link_transmissao = None
+            validar_coordenadas(evento.local_latitude, evento.local_longitude)
+            evento.nome_local = self.mapa_servico.buscar_endereco_por_coordenadas(
+                evento.local_latitude,
+                evento.local_longitude
+            )
+            local_calendario = evento.nome_local
 
         if evento.calendario_evento_id:
             self.calendario.atualizar_evento(
                 evento.calendario_evento_id,
                 evento,
-                evento.nome_local
+                local_calendario
             )
 
         return self.repositorio.salvar(evento)
 
+    def alterar_situacao(self, evento_id: int, dados: SolicitacaoSituacaoEvento):
+        """
+        US14: marca o evento como cancelado ou adiado, ou desfaz a marcação.
+        Nada é apagado e ninguém é avisado: a comunicação com os inscritos
+        continua sendo feita pela equipe.
+        """
+        evento = self.buscar_evento(evento_id)
+        evento.situacao = dados.situacao.value
+        evento.nova_data = dados.nova_data
+        evento = self.repositorio.salvar(evento)
+
+        # A agenda do Google é um espelho: se falhar, o site já está certo e
+        # a próxima edição do evento sincroniza de novo.
+        if evento.calendario_evento_id:
+            try:
+                local_calendario = (
+                    evento.link_transmissao or "Online"
+                    if _is_online(evento.modalidade)
+                    else evento.nome_local
+                )
+                self.calendario.atualizar_evento(
+                    evento.calendario_evento_id, evento, local_calendario
+                )
+            except RuntimeError as erro:
+                print(f"Erro ao atualizar a situacao no Google Calendario: {erro}")
+
+        return evento
+
+    def resumo_exclusao(self, evento_id: int) -> dict:
+        self.buscar_evento(evento_id)
+        return {"evento_id": evento_id, **self.repositorio.contar_vinculos(evento_id)}
+
     def deletar_evento(self, evento_id: int):
         evento = self.buscar_evento(evento_id)
+        calendario_id = evento.calendario_evento_id
 
-        if evento.calendario_evento_id:
-            self.calendario.deletar_evento(evento.calendario_evento_id)
+        try:
+            self.repositorio.preparar_exclusao(evento)
 
-        self.repositorio.deletar(evento)
+            if calendario_id:
+                self.calendario.deletar_evento(calendario_id)
+
+            self.repositorio.confirmar_exclusao()
+
+        except Exception:
+            self.repositorio.cancelar_exclusao()
+            raise
 
     def pesquisar_eventos(self, termo: str):
         termo = termo.strip()
@@ -117,4 +195,12 @@ class ServicoEvento:
             raise ValueError("Vínculo entre evento e participante não encontrado.")
 
         self.repositorio.desvincular_participante(vinculo)
-    
+
+    def excluir_fotos_galeria(
+        self, evento_id: int, dados: SolicitacaoFotosExcluidas
+    ) -> None:
+        self.buscar_evento(evento_id)
+        self.repositorio.registrar_fotos_excluidas(evento_id, dados.fotos)
+
+    def listar_fotos_excluidas(self, evento_id: int) -> set[str]:
+        return self.repositorio.buscar_fotos_excluidas(evento_id)

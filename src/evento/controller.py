@@ -1,11 +1,19 @@
 from fastapi import APIRouter, status, HTTPException, Depends, Query
 from fastapi.security import HTTPBearer
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from src.database import obter_banco
 from src.evento.repository import RepositorioEvento
 from src.evento.service import ServicoEvento
-from src.evento.schema import RespostaEvento, SolicitacaoEvento, RespostaItemGaleria
+from src.evento.schema import (
+    RespostaEvento,
+    RespostaResumoExclusaoEvento,
+    SolicitacaoEvento,
+    RespostaItemGaleria,
+    SolicitacaoFotosExcluidas,
+    SolicitacaoSituacaoEvento,
+)
 from src.calendario.service import ServicoCalendario
 from src.drive.schema import RespostaDrive
 from src.drive.service import ServicoDrive
@@ -71,6 +79,38 @@ def atualizar_evento(
         raise HTTPException(status_code=400, detail=str(erro)) from erro
 
 
+@router.patch("/{evento_id}/situacao", response_model=RespostaEvento)
+def alterar_situacao_evento(
+    evento_id: int,
+    solicitar: SolicitacaoSituacaoEvento,
+    servico: ServicoEvento = Depends(get_servico),
+    _: dict = Depends(verificar_permissao_setor(SETOR_EVENTOS))
+):
+    """
+    US14: marca o evento como cancelado ou adiado, ou volta para ativo.
+    O evento, as inscrições e as fotos continuam guardados.
+    """
+    try:
+        return servico.alterar_situacao(evento_id, solicitar)
+    except ValueError as erro:
+        raise HTTPException(status_code=404, detail=str(erro)) from erro
+
+
+@router.get(
+    "/{evento_id}/exclusao",
+    response_model=RespostaResumoExclusaoEvento,
+)
+def resumir_exclusao_evento(
+    evento_id: int,
+    servico: ServicoEvento = Depends(get_servico),
+    _: dict = Depends(verificar_roles(["superadmin"])),
+):
+    try:
+        return servico.resumo_exclusao(evento_id)
+    except ValueError as erro:
+        raise HTTPException(status_code=404, detail=str(erro)) from erro
+
+
 @router.delete("/{evento_id}", status_code=204)
 def deletar_evento(
     evento_id: int,
@@ -81,6 +121,18 @@ def deletar_evento(
         servico.deletar_evento(evento_id)
     except ValueError as erro:
         raise HTTPException(status_code=404, detail=str(erro)) from erro
+    except RuntimeError as erro:
+        # A agenda do Google não confirmou a remoção: o banco foi revertido.
+        raise HTTPException(
+            status_code=502,
+            detail="Não foi possível remover o evento da agenda do Google. Nada foi apagado.",
+        ) from erro
+    except SQLAlchemyError as erro:
+        # Qualquer falha no banco desfaz a exclusão inteira (A3).
+        raise HTTPException(
+            status_code=500,
+            detail="Não foi possível excluir o evento. Nada foi apagado.",
+        ) from erro
 
 
 @router.get("/galerias/todas", response_model=list[RespostaItemGaleria])
@@ -100,7 +152,10 @@ def listar_todas_galerias(servico: ServicoEvento = Depends(get_servico)):
 
             try:
                 fotos = drive.listar_fotos(evento.link_galeria)
+                excluidas = set(servico.listar_fotos_excluidas(evento.evento_id))
                 for foto in fotos:
+                    if foto.id in excluidas:
+                        continue
                     resultado.append(
                         RespostaItemGaleria(
                             id=foto.id,
@@ -131,14 +186,32 @@ def listar_galeria_evento(
             return []
 
         drive = ServicoDrive()
+        fotos = drive.listar_fotos(evento.link_galeria)
+        excluidas = set(servico.listar_fotos_excluidas(evento_id))
 
-        return drive.listar_fotos(evento.link_galeria)
+        return [foto for foto in fotos if foto.id not in excluidas]
 
     except ValueError as erro:
         raise HTTPException(status_code=404, detail=str(erro)) from erro
 
     except RuntimeError as erro:
         raise HTTPException(status_code=502, detail=str(erro)) from erro
+
+
+@router.post(
+    "/{evento_id}/galeria/excluidas",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def excluir_fotos_galeria_evento(
+    evento_id: int,
+    solicitar: SolicitacaoFotosExcluidas,
+    servico: ServicoEvento = Depends(get_servico),
+    _: dict = Depends(verificar_roles(["superadmin"])),
+):
+    try:
+        servico.excluir_fotos_galeria(evento_id, solicitar)
+    except ValueError as erro:
+        raise HTTPException(status_code=404, detail=str(erro)) from erro
 
 
 @router.get(

@@ -1,5 +1,5 @@
 import os
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 import json
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -7,6 +7,17 @@ from urllib.request import Request, urlopen
 
 from src.calendario.schema import RespostaEvento, SolicitacaoEvento
 from src.auth.service import ServicoAuth  
+
+_AVISO_NO_TITULO = {"cancelado": "[CANCELADO] ", "adiado": "[ADIADO] "}
+
+
+def titulo_na_agenda(evento) -> str:
+    """US14: o evento cancelado ou adiado aparece com o aviso na agenda do Google."""
+    situacao = getattr(evento, "situacao", None)
+    situacao = getattr(situacao, "value", situacao)
+    prefixo = _AVISO_NO_TITULO.get(situacao, "") if isinstance(situacao, str) else ""
+    return f"{prefixo}{evento.nome}"
+
 
 class ServicoCalendario:
     def __init__(self):
@@ -29,8 +40,7 @@ class ServicoCalendario:
 
     def _montar_url_evento(self) -> str:
         parametros = {
-            "timeMin": datetime.now(timezone.utc).isoformat(),
-            "maxResults": 10,
+            "maxResults": 250,
             "singleEvents": "true",
             "orderBy": "startTime",
         }
@@ -120,7 +130,7 @@ class ServicoCalendario:
         url = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
 
         corpo = {
-            "summary": evento.nome,
+            "summary": titulo_na_agenda(evento),
             "location": nome_local,
             "description": evento.descricao,
             "start": {"dateTime": (evento.data_inicio.isoformat())},
@@ -151,7 +161,7 @@ class ServicoCalendario:
         )
 
         corpo = {
-            "summary": evento.nome,
+            "summary": titulo_na_agenda(evento),
             "location": nome_local,
             "description": evento.descricao,
             "start": {"dateTime": evento.data_inicio.isoformat()},
